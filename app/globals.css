@@ -1,0 +1,23 @@
+body {
+  background: #ffffff;
+  color: #000000;
+  margin: 8px;
+  font-family: Arial, Helvetica, "MS PGothic", "ＭＳ Ｐゴシック", "MS Gothic", "ＭＳ ゴシック", sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+a { color: #0000ee; }
+a:visited { color: #551a8b; }
+.wrap { max-width: 640px; margin: 0 auto; text-align: center; }
+h1 { font-size: 32px; margin: 16px 0 8px; }
+hr { margin: 16px 0; }
+input[type="text"] { width: 80%; max-width: 360px; font-size: 16px; }
+.gag { margin: 24px 0; }
+.gag h2 { font-size: 28px; margin: 8px 0 12px; }
+.gag img { width: 100%; max-width: 512px; height: auto; border: 1px solid #000; }
+.noimg { width: 100%; max-width: 512px; margin: 0 auto; padding: 48px 0; border: 1px solid #000; }
+.detail { text-align: left; display: inline-block; max-width: 512px; width: 100%; }
+.detail dt { font-weight: bold; margin-top: 8px; }
+.detail dd { margin: 0 0 0 1em; }
+.error { color: #ff0000; }
+.small { font-size: 12px; }
