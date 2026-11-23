@@ -2,13 +2,16 @@
 
 import { useRef, useState } from "react";
 import type { Gag, GagResult } from "@/lib/gag";
+import { requestPollinationsImage } from "@/lib/pollinations-client";
+
+type GagResponse = GagResult & { provider?: string; imageProvider?: string };
 
 type ImageState = { status: "loading" } | { status: "done"; src: string } | { status: "error"; message: string };
 
 export default function Home() {
   const [input, setInput] = useState("");
   const [word, setWord] = useState("");
-  const [result, setResult] = useState<(GagResult & { provider?: string }) | null>(null);
+  const [result, setResult] = useState<GagResponse | null>(null);
   const [images, setImages] = useState<ImageState[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -42,11 +45,13 @@ export default function Home() {
       if (id !== requestId.current) return;
       if (!res.ok) throw new Error(data.error || "エラーが発生しました。");
 
-      const gags = (data as GagResult).gags;
+      const response = data as GagResponse;
+      const gags = response.gags;
       history.current = [...history.current, ...gags.map((g) => g.gag_name)];
-      setResult(data as GagResult);
+      setResult(response);
       setImages(gags.map(() => ({ status: "loading" })));
-      gags.forEach((g, i) => loadImage(g, i, id, signal));
+      const viaServer = response.imageProvider === "openai";
+      gags.forEach((g, i) => loadImage(g, i, id, signal, viaServer));
     } catch (e) {
       if (id === requestId.current) setError(e instanceof Error ? e.message : "エラーが発生しました。");
     } finally {
@@ -54,21 +59,27 @@ export default function Home() {
     }
   }
 
-  async function loadImage(gag: Gag, index: number, id: number, signal: AbortSignal) {
+  async function loadImage(gag: Gag, index: number, id: number, signal: AbortSignal, viaServer: boolean) {
     let next: ImageState;
     try {
-      const res = await fetch("/api/image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: gag.image_prompt }),
-        signal,
-      });
-      const data = await res.json().catch(() => ({}));
-      next = res.ok && data.image
-        ? { status: "done", src: data.image }
-        : { status: "error", message: data.error || "画像の生成に失敗しました。" };
-    } catch {
-      next = { status: "error", message: "画像の生成に失敗しました。" };
+      if (viaServer) {
+        const res = await fetch("/api/image", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: gag.image_prompt }),
+          signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        next = res.ok && data.image
+          ? { status: "done", src: data.image }
+          : { status: "error", message: data.error || "画像の生成に失敗しました。" };
+      } else {
+        const src = await requestPollinationsImage(gag.image_prompt, signal);
+        next = { status: "done", src };
+      }
+    } catch (e) {
+      if (signal.aborted) return;
+      next = { status: "error", message: e instanceof Error ? e.message : "画像の生成に失敗しました。" };
     }
     if (id !== requestId.current) return;
     setImages((prev) => prev.map((s, i) => (i === index ? next : s)));

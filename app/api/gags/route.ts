@@ -1,7 +1,10 @@
 import { currentProvider, GagError, generateGags, MSG } from "@/lib/gag";
+import { currentImageProvider } from "@/lib/image-style";
+import { checkRateLimit, clientIp } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+// Vercel の無料プランで使える上限
+export const maxDuration = 60;
 
 export async function POST(req: Request) {
   let body: unknown;
@@ -18,9 +21,17 @@ export async function POST(req: Request) {
     ? avoid.filter((a): a is string => typeof a === "string").slice(0, 30)
     : [];
 
+  const waitMinutes = checkRateLimit(clientIp(req));
+  if (waitMinutes !== null) {
+    return Response.json(
+      { error: `短い時間に生成しすぎです。${waitMinutes}分ほど待ってからお試しください。` },
+      { status: 429 },
+    );
+  }
+
   try {
     const result = await generateGags(text, avoidList);
-    return Response.json({ ...result, provider: currentProvider() });
+    return Response.json({ ...result, provider: currentProvider(), imageProvider: currentImageProvider() });
   } catch (err) {
     if (err instanceof GagError) return Response.json({ error: err.message }, { status: err.status });
     console.error(err);
