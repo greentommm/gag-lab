@@ -8,10 +8,14 @@ const jsonSchema = z.toJSONSchema(ResultSchema);
 // 混雑(503)や無料枠の上限(429)のとき、順に別のモデルで試す
 // （gemini-2.5-flash は新規ユーザーには提供終了のため使わない）
 const FALLBACK_MODELS = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"];
-// Vercel の上限（60秒）に収まるよう、1モデルあたりと全体の待ち時間を決めておく
-const MODEL_TIMEOUT_MS = 35_000;
+// Vercel の上限（60秒）に収まるよう、全体の待ち時間を決めておく
 const TOTAL_BUDGET_MS = 52_000;
+// これより残り時間が少ないなら、新しいモデルは始めない
 const MIN_TRY_MS = 8_000;
+// 返事が遅いモデルがあれば、この時間がたった時点で別のモデルも並行して試す
+// （Gemini は普段でも15〜30秒かかるため、早すぎると無料枠を二重に使う）
+const BACKUP_AFTER_MS = 20_000;
+const MAX_PARALLEL = 2;
 
 function isTimeout(err: unknown) {
   return err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
@@ -34,46 +38,91 @@ const MSG_BUSY = "Gemini が混み合っています。しばらくしてから�
 
 export async function generateWithGemini(word: string, avoid: string[]): Promise<GagResult> {
   const first = process.env.GEMINI_MODEL || "gemini-3.8-flash";
-  const models = [first, ...FALLBACK_MODELS.filter((m) => m !== first)];
   const deadline = Date.now() + TOTAL_BUDGET_MS;
   let dailyLimited = 0;
   let busy = 0;
 
-  for (const model of models) {
+  // 上限に達しているモデルは最初から外す
+  const queue: string[] = [];
+  for (const model of [first, ...FALLBACK_MODELS.filter((m) => m !== first)]) {
     const skip = exhaustedUntil.get(model);
     if (skip && skip.until > Date.now()) {
       if (skip.daily) dailyLimited++;
       else busy++;
-      continue;
-    }
-    const remaining = deadline - Date.now();
-    if (remaining < MIN_TRY_MS) {
-      busy++;
-      continue;
-    }
-    try {
-      return await generateWithModel(model, word, avoid, Math.min(MODEL_TIMEOUT_MS, remaining));
-    } catch (err) {
-      if (err instanceof QuotaError) {
-        exhaustedUntil.set(model, { until: Date.now() + err.retryAfterMs, daily: err.daily });
-        if (err.daily) dailyLimited++;
-        else busy++;
-      } else if (
-        (err instanceof GagError && err.status === 404) ||
-        (err instanceof ApiError && err.status >= 500) ||
-        isTimeout(err)
-      ) {
-        busy++;
-      } else {
-        throw err;
-      }
-      console.warn(`[gemini] ${model} unavailable, trying next model`);
+    } else {
+      queue.push(model);
     }
   }
 
-  if (dailyLimited > 0 && busy === 0) throw new GagError(MSG_DAILY_LIMIT, 429);
-  if (dailyLimited > 0) throw new GagError(MSG_BUSY_AND_LIMIT, 503);
-  throw new GagError(MSG_BUSY, 503);
+  const stopAll = new AbortController();
+
+  return new Promise<GagResult>((resolve, reject) => {
+    let inFlight = 0;
+    let settled = false;
+    let backupTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const finish = (done: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(backupTimer);
+      stopAll.abort(); // 残りのリクエストは止める
+      done();
+    };
+
+    const giveUp = () =>
+      finish(() => {
+        if (dailyLimited > 0 && busy === 0) reject(new GagError(MSG_DAILY_LIMIT, 429));
+        else if (dailyLimited > 0) reject(new GagError(MSG_BUSY_AND_LIMIT, 503));
+        else reject(new GagError(MSG_BUSY, 503));
+      });
+
+    const launch = () => {
+      if (settled) return;
+      const remaining = deadline - Date.now();
+      const model = remaining >= MIN_TRY_MS ? queue.shift() : undefined;
+      if (!model) {
+        if (inFlight === 0) giveUp();
+        return;
+      }
+
+      inFlight++;
+      const signal = AbortSignal.any([stopAll.signal, AbortSignal.timeout(remaining)]);
+      generateWithModel(model, word, avoid, signal).then(
+        (result) => finish(() => resolve(result)),
+        (err) => {
+          inFlight--;
+          if (settled) return;
+          if (err instanceof QuotaError) {
+            exhaustedUntil.set(model, { until: Date.now() + err.retryAfterMs, daily: err.daily });
+            if (err.daily) dailyLimited++;
+            else busy++;
+          } else if (
+            (err instanceof GagError && err.status === 404) ||
+            (err instanceof ApiError && err.status >= 500) ||
+            isTimeout(err)
+          ) {
+            busy++;
+          } else {
+            finish(() => reject(err));
+            return;
+          }
+          console.warn(`[gemini] ${model} unavailable, trying next model`);
+          launch(); // すぐ失敗したモデルの代わりを、待たずに始める
+        },
+      );
+
+      // 返事が遅ければ、予備のモデルも並行して始める
+      clearTimeout(backupTimer);
+      backupTimer = setTimeout(() => {
+        if (!settled && inFlight < MAX_PARALLEL) {
+          console.warn(`[gemini] ${model} is slow, starting a backup model`);
+          launch();
+        }
+      }, BACKUP_AFTER_MS);
+    };
+
+    launch();
+  });
 }
 
 function quotaFromError(err: ApiError): QuotaError {
@@ -87,7 +136,7 @@ async function generateWithModel(
   model: string,
   word: string,
   avoid: string[],
-  timeoutMs: number,
+  signal: AbortSignal,
 ): Promise<GagResult> {
   client ??= new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
@@ -101,8 +150,7 @@ async function generateWithModel(
         responseMimeType: "application/json",
         responseJsonSchema: jsonSchema,
         temperature: 1.0,
-        // 混雑時に応答が返らないことがあるので、待ちすぎずに次のモデルへ
-        abortSignal: AbortSignal.timeout(timeoutMs),
+        abortSignal: signal,
       },
     });
     text = res.text;
